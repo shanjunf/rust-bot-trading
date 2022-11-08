@@ -1,0 +1,966 @@
+mod db;
+mod constant;
+mod common;
+mod indicate;
+
+use indicate::{ zigzag, ZigzagMapBuffer };
+// use ta_common_rs::math;
+use db::{Operator, WatchSwing, SwingStatus, SwingUnit, LtfSwing, SwingFvg, SwingFvgUnit};
+use db::{User, Candle, Zigzag};
+use std::convert::TryInto;
+use std::fmt::format;
+// use std::hash::Hash;
+use chrono::{Utc, TimeZone, NaiveDateTime, DateTime};
+
+use common::{ CustomError, Result };
+
+use once_cell::sync::Lazy;
+// use mongodb::error::Error;
+use core::any::type_name;
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+use mongodb::options::{FindOneOptions, FindOptions};
+use mongodb::bson::{doc, Bson, Document, oid::ObjectId};
+use binance::api::*;
+use binance::model::*;
+use binance::market::*;
+use binance::general::*;
+use binance::websockets::*;
+
+use std::sync::atomic::{AtomicBool};
+
+use std::error::Error;
+// use once_cell::sync::Lazy;
+
+// type Result<T> = Result<T, Error>;
+
+
+fn process() {
+
+
+    let candle = Candle::collection().find_one(None, None).unwrap();
+
+    println!("candle is {candle:?}");
+
+    let user = User{
+        name: Some("aaa".to_string()),
+        email: "123".to_string(),
+        time: Utc::now()
+    };
+
+    println!("{}", Utc::now());
+
+    let ret = User::collection().insert_one(user, None).unwrap();
+
+    println!("insert id: {}", ret.inserted_id);
+
+
+    let filter = doc! {
+        "email": "123",
+        "name": "aaa"
+     };
+
+    let ret = User::collection().find_one(filter, None).unwrap().unwrap();
+
+    println!("find {ret:?}");
+
+    let filter = doc! {
+        "email": "456"
+     };
+
+    let cursor = User::collection().find(filter, None).unwrap();
+
+    for result in cursor {
+        println!("email: {}", result.unwrap().email);
+    }
+
+    let ret = User::collection().update_one(doc!{"email": "123"}, doc!{"$set":{"email": "456", "hhh": 1}}, None).unwrap();
+    
+
+    println!("update count: {}", ret.modified_count);
+
+
+    let ret = User::collection().delete_one(doc!{"email": "123"}, None).unwrap();
+
+    println!("delete count: {}", ret.deleted_count);
+
+    // let zigzag = Zigzag {
+    //     time: 1651795200000,
+    //     symbol: "dddddd".to_string(),
+    //     interval: "dddddd".to_string(),
+    //     high:  "dddddd".to_string(),
+    //     low:  "dddddd".to_string(),
+    //     time_date:  "dddddd".to_string(),
+    //     tag: "H".to_string(), //H, L
+    // };
+
+    let fmt = "%Y-%m-%d %H:%M:%S %s";
+
+    let a = Utc.timestamp(1651795200000, 0);
+    let format = Utc::now().format(fmt).to_string();
+    let b = a.timestamp();
+    println!("time is {b}, {}", format);
+
+}
+
+fn type_of<T>(_: T) -> &'static str {
+    type_name::<T>()
+}
+
+fn get_exchange_info(symbol: &str) -> Result<f64> {
+    let general: General = Binance::new(None, None);
+    let mut ret = 0.0;
+    match general.exchange_info() {
+        Ok(answer) => {
+            for n in answer.symbols.into_iter() {
+                if n.symbol == *symbol {
+                    // println!("{n:#?}");
+                    for f in n.filters.into_iter() {
+                        match f {
+                            Filters::LotSize{min_qty: x, max_qty: y, step_size: z} => {
+                                // println!("{}, {}, {}", x, y, z);
+                                ret = z.parse::<f64>()?;
+                            },
+                            _ => (),
+                        }
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+        }
+    }
+
+    Ok(ret)
+}
+
+fn slice_bars<T, const N: usize>(v: Vec<T>) -> [T; N] {
+    v.try_into()
+        .unwrap_or_else(|v: Vec<T>| panic!("Expected a Vec of length {} but it was {}", N, v.len()))
+}
+
+fn compute_zigzag (symbol: &str, interval: &str) {
+
+    // todo!();
+    /* let step_size = match get_exchange_info(symbol) {
+        Ok(x) => x,
+        Err(e) => {panic!("Problem opening the file: {:?}", e)}
+    }; */
+
+    let step_size = 0.00001;
+    let depth = 12;
+
+
+    let mut buffer = ZigzagMapBuffer{
+        low_map: HashMap::new(),
+        high_map: HashMap::new(),
+        zigzag_map: HashMap::new()
+    };
+
+    let mut candles: Vec<Candle> = Vec::new();
+    let find_options = FindOptions::builder().sort(doc! { "time": 1 }).build();
+    match Candle::collection().find(doc!{"symbol": symbol, "interval": interval/*, "time": { "$lt": 1653955200000i64 }*/}, find_options) {
+        Ok(r) => {
+            for c in r {
+                match c {
+                    Ok(x) => {
+                        candles.push(x);
+                    },
+                    Err(re) => {
+                        println!("error: {re}");
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+        }
+    }
+
+    match Zigzag::collection().find(doc!{"symbol": symbol, "interval": interval, "depth": depth as i32}, None) {
+        Ok(r) => {
+            for c in r {
+                match c {
+                    Ok(x) => {
+                        buffer.zigzag_map.insert(x.time, x.value);
+                        if x.tag == 1 {
+                            buffer.high_map.insert(x.time, x.value);
+                        }
+                        else if x.tag == -1 {
+                            buffer.low_map.insert(x.time, x.value);
+                        }
+                        else {
+                            println!("expect zigzag tag {}, need 1 or -1", x.tag);
+                        }
+                    },
+                    Err(re) => {
+                        println!("{re}");
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+        }
+    }
+    
+    
+
+    match zigzag(&candles, &mut buffer, step_size, depth) {
+        Ok(r) => {
+
+            println!("rm_set = {:?}, add_map= {:?}", r.0, r.1);
+
+            for n in r.0.into_iter() {
+                if let Some(x) = candles.get(n) {
+                    if let Ok(x) = Zigzag::collection().delete_one(doc! {"symbol": symbol, "interval": interval, "time": x.time}, None) {
+                        // println!("deleted_count {}", x.deleted_count);
+                    }
+                    else {
+                        println!("error--")
+                    }
+                }
+            }
+
+            for n in r.1.into_iter() {
+                if let Some(x) = candles.get(n.0) {
+                    if n.1 != 'R' {
+                        let mut value = 0.0;
+                        let mut tag = 0;
+                        if n.1 == 'H' {
+                            value = x.high;
+                            tag = 1;
+                        }
+                        else {
+                            value = x.low;
+                            tag = -1;
+                        }
+
+                        let zig = Zigzag {
+                            id: ObjectId::new(),
+                            time: x.time,
+                            symbol: x.symbol.to_owned(),
+                            depth: depth as i32, 
+                            interval: x.interval.to_owned(),
+                            value,
+                            time_date: x.time_date.to_owned(),
+                            tag: tag,
+                            nmacd: x.nmacd.clone()
+                        };
+
+                        if let Ok(y) = Zigzag::collection().insert_one(zig, None) {
+                            // println!("inserted_id {}", y.inserted_id);
+                        }
+                        else {
+                            println!("error--")
+                        }
+                    }
+                }
+            }
+        },
+        Err(e) => {
+            println!("{e}");
+        }
+    }
+
+}
+
+// direction 1 低->高， -1 高->低
+fn compute_fb_50(symbol: &str, interval: &str, start_time: i64, end_time: i64) -> Result<f64> {
+
+    //计算最高值， 最低值 画fib
+    // Candle::collection().aggregate(pipeline, options)
+
+    let query = doc! {"symbol": symbol, "interval": interval, "time": {"$gt": start_time, "$lt": end_time}};
+    let find_one_options = FindOneOptions::builder().sort(doc! {"high_value": -1}).build();
+    let max_candle = Candle::collection().find_one(query.to_owned(), find_one_options)?;
+
+    let find_one_options = FindOneOptions::builder().sort(doc! {"low_value": 1}).build();
+    let min_candle = Candle::collection().find_one(query, find_one_options)?;
+
+    if let Some(x) = max_candle {
+        if let Some(y) = min_candle {
+            return Ok((x.high - y.low) / 2.0 + y.low);
+        }
+    }
+    let error = CustomError("Error: has no fib 0.5 value".to_string());
+    Err(Box::new(error))
+
+}
+
+
+//check candle 与 fvg重合部分
+fn check_overlap(direction: i32, (fvg_start, fvg_end): (f64, f64), (candle_low, candle_high): (f64, f64)) -> Result<(f64, f64)> {
+    //向上突破->向上回调
+    if direction == 1 {
+        let s = fvg_start.max(candle_low);
+        let e = fvg_end.min(candle_high);
+
+        if s > e {
+            return Ok((0.0, 0.0));
+        }
+
+        //重合部分 s..e
+        Ok((s, e))
+    }
+    else {
+        let s = fvg_start.min(candle_high);
+        let e = fvg_end.max(candle_low);
+        if s < e {
+            return Ok((0.0, 0.0));
+        }
+        //重合部分 e..s
+        Ok((e, s))
+    }
+}
+
+//判断返回fvg区域, 达到fb-0.5; candle：实时价格，不需要蜡烛结束
+fn proc_backto_fvg(watch: &mut WatchSwing, candle: &Candle, symbol: &str, interval: &str) -> Result<()> {
+    // let mut zero_value = 0.0;
+    /*
+    if let Some(x) = watch.fb_zero_value {
+        zero_value = x;
+    }
+    else {
+        return Ok(());
+    }
+    */
+    let fib_50 = compute_fb_50(symbol, interval, watch.one.time, candle.time)?;
+
+    let mut make_order = false;
+    let mut target = 0.0;
+
+    let (mut overlap_start, mut overlap_end) = (0.0, 0.0);
+
+    if let Some(fvg1) = watch.fvg1.as_ref() {
+        (overlap_start, overlap_end) = check_overlap(watch.tag, (fvg1.start, fvg1.end), (candle.low, candle.high))?;
+    }
+    else if let Some(fvg2) = watch.fvg2.as_ref() {
+        (overlap_start, overlap_end) = check_overlap(watch.tag, (fvg2.start, fvg2.end), (candle.low, candle.high))?;
+    }
+    else if let Some(fvg3) = watch.fvg3.as_ref() {
+        (overlap_start, overlap_end) = check_overlap(watch.tag, (fvg3.start, fvg3.end), (candle.low, candle.high))?;
+    }
+    
+    if watch.tag == 1 {
+        
+        if overlap_start > 0.0 && overlap_end > 0.0 {//有重叠
+            if overlap_end > fib_50 { //above the fib 0.5
+                if overlap_start > fib_50 {
+                    target = overlap_start;
+                }
+                else {
+                    target = fib_50;
+                }
+                make_order = true; //target
+            }
+        }
+    }
+    else {
+        if overlap_start > 0.0 && overlap_end > 0.0 {//有重叠
+            if overlap_end < fib_50 { //below the fib 0.5
+                if overlap_start  < fib_50 {
+                    target = overlap_start;
+                }
+                else {
+                    target = fib_50;
+                }
+                make_order = true;
+            }
+        }
+    }
+
+    if make_order {
+        todo!("make order {}", target);
+
+        
+    }
+
+    Ok(())
+}
+
+//update fb
+/*
+    draw the fibs from the highest price after the 4h swing break, 
+    down to the lowest price that occurs both after the break and before and before price trades back into the fvg
+*/
+fn proc_update_fb_zero_value(watch: &mut WatchSwing, candle: &Candle) -> Result<()> {
+
+    let mut update_fb = false;
+    if watch.tag == 1 {
+        let low: f64 = candle.low;
+
+        if let Some(x) = watch.fb_zero_value {
+            if low < x {
+                update_fb = true;
+                watch.fb_zero_value = Some(low);
+            }
+        }
+        else {
+            update_fb = true;
+            watch.fb_zero_value = Some(low);
+        }
+    }
+    else {
+        let high = candle.high;
+        if let Some(x) = watch.fb_zero_value {
+            if high > x {
+                update_fb = true;
+                watch.fb_zero_value = Some(high);
+            }
+        }
+        else {
+            update_fb = true;
+            watch.fb_zero_value = Some(high);
+        }
+    }
+
+    if update_fb {
+        WatchSwing::collection().update_one(doc! {"_id": watch.id}, 
+                doc! {"$set": 
+                                {   "fb_zero_value": watch.fb_zero_value}
+                             }, None)?;
+    }
+
+    Ok(())
+}
+
+//fvg
+fn proc_form_fvg(watch: &mut WatchSwing, candles: &[Candle], symbol: &str, interval: &str) -> Result<bool> {
+    if let Some(ltf) = watch.ltf_swing.as_ref() {
+        if ltf.breakout_time == candles[1].time {
+            let find_options = FindOptions::builder().sort(doc! {"time": 1}).build();
+            let cursor = Candle::collection().find(doc! {"symbol": symbol, "interval": interval, "time": {"$gt": ltf.time, "$lte": candles[2].time}, }, find_options)?;
+            let mut vec: Vec<Candle> = Vec::new();
+            for ret in cursor {
+                let candle = ret?;
+                vec.push(candle);
+            }
+
+            let mut fvgs: Vec<(i64, String, i64, String, f64, f64)> = Vec::new();
+
+            for i in (0..vec.len()).rev() {
+
+                if i < 3 {
+                    break
+                }
+                let group = &vec[i-3..i];
+
+                if watch.tag == 1 {
+
+                    let c1 = group[2].high;
+                    let c2 = group[0].low;
+                    /*
+                    Note: Any FVG that forms before the 15m swing low is traded through can also be a valid 
+                    FVG. The FVG does not have to be created by the same candle that breaks the 15m 
+                    swing low, but it ideally it should be above the 15m swing low.
+                    */
+                    if c2 > c1 && c1 > ltf.value { //fvg
+                        fvgs.push((group[0].time, group[0].time_date.to_owned(), group[2].time, group[2].time_date.to_owned(), c2, c1));
+                    }
+                }
+                else {
+                    let c1 = group[0].high;
+                    let c2 = group[2].low;
+
+                    if c2 > c1 && c2 < ltf.value { //fvg
+                        fvgs.push((group[0].time, group[0].time_date.to_owned(), group[2].time, group[2].time_date.to_owned(), c2, c1));
+                    }
+                }
+            }
+
+            if fvgs.len() > 0 {
+                for i in 0..fvgs.len() {
+                    let group = &fvgs[i];
+                    let fvg = SwingFvg {
+                        start_time: group.0,
+                        start_time_date: group.1.to_owned(),
+                        end_time: group.2,
+                        end_time_date: group.3.to_owned(),
+                        start: group.4,
+                        end: group.5
+                    };
+
+                    if i == 0 {
+                        watch.fvg1 = Some(fvg);
+                    }
+                    else if i == 1 {
+                        watch.fvg2 = Some(fvg);
+                    }
+                    else if i == 2 {
+                        watch.fvg3 = Some(fvg);
+                    }
+                }
+
+                WatchSwing::collection().update_one(doc! {"_id": watch.id}, 
+                        doc! {"$set": 
+                                        {   "status": SwingStatus::WaitingBackFvg as i32,
+                                            "fvg1": bson::to_document(&watch.fvg1)?, 
+                                            "fvg2": bson::to_document(&watch.fvg2)?,
+                                            "fvg3": bson::to_document(&watch.fvg3)?}
+                                     }, None)?;
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+//处理低时段swing
+fn proc_ltf_swing(watch: &mut WatchSwing, candles: &[Candle], symbol: &str, interval: &str) -> Result<()> {
+    
+    let mut target_candle: Option<&Candle> = None;
+    let mut new_candles = Vec::new();
+
+    let find_options = FindOneOptions::builder().sort(doc! { "time": 1 }).build();
+
+    let mut key: String = "".to_owned();
+    let mut value = 0f64;
+    if watch.tag == 1 {
+        key = "high_value".to_string();
+        value = if watch.one.value > watch.value {
+            watch.one.value
+        }
+        else {
+            watch.two.value
+        };
+    }
+    else {
+        key = "low_value".to_string();
+        value = if watch.one.value < watch.value {
+            watch.one.value
+        }
+        else {
+            watch.two.value
+        };
+    }
+   
+    if let Some(c) = Candle::collection().find_one(doc! {"symbol": symbol, "interval": interval, "time": {"$gt": watch.time, "$lt": watch.three.time}, key: value}, find_options)? {
+
+        let cursor = Candle::collection().find(doc! {"symbol": symbol, "interval": interval, "time": {"$gt": watch.time, "$lt": c.time}, }, None)?;
+        
+        for r in cursor {
+            new_candles.push(r?);
+        }
+
+        let mut buffer = ZigzagMapBuffer{
+            low_map: HashMap::new(),
+            high_map: HashMap::new(),
+            zigzag_map: HashMap::new()
+        };
+
+        let step_size = 0.00001;
+        let depth = 12;
+
+        let (set, map) = zigzag(&new_candles, &mut buffer, step_size, depth)?;
+
+        let mut target = 0;
+        for (index, tag) in map.into_iter() {
+            if tag == 'H' {
+                if watch.tag == -1 {
+                    if index > target {
+                        target = index;
+                    }
+                }
+            }
+            else {
+                if watch.tag == 1 {
+                    if index > target {
+                        target = index;
+                    }
+                }
+            };
+        };
+        if target > 0 {
+            //low time frame 高点/低点
+            target_candle = new_candles.get(target);
+        }
+    }
+
+    if let Some(candle) = target_candle {
+
+        println!("{}", candles[0].time_date);
+        if candles[0].time < candle.time {
+            return Ok(());
+        }
+
+        //低点突破， candles[2]是当前最新蜡烛
+        let open = candles[2].open;
+        let close = candles[2].close;
+
+        if watch.tag == 1 {
+            let lowest = candle.low;
+
+            if open.min(close) < lowest {
+                // insert 
+                let ltf_swing = LtfSwing {
+                    time: candle.time,
+                    value: lowest,
+                    time_date: candle.time_date.to_owned(),
+                    breakout_time: candles[2].time,
+                    breakout_body_value: open.min(close),
+                    breakout_time_date: candles[2].time_date.to_owned()
+                };
+
+                let up = bson::to_document(&ltf_swing)?;
+                WatchSwing::collection().update_one(doc! {"_id": watch.id}, doc! {"$set": {"ltf_swing": up}}, None)?;
+                watch.ltf_swing = Some(ltf_swing);
+            }
+        }
+        else {
+            let highest = candle.high;
+
+            if open.max(close) > highest {
+                // insert 
+
+                let ltf_swing = LtfSwing {
+                    time: candle.time,
+                    value: highest,
+                    time_date: candle.time_date.to_owned(),
+                    breakout_time: candles[2].time,
+                    breakout_body_value: open.max(close),
+                    breakout_time_date: candles[2].time_date.to_owned()
+                };
+
+                let up = bson::to_document(&ltf_swing)?;
+                WatchSwing::collection().update_one(doc! {"_id": watch.id}, doc! {"$set": {"ltf_swing": up}}, None)?;
+                watch.ltf_swing = Some(ltf_swing);
+            }
+        }
+    }
+    Ok(())
+  
+}
+
+//处理高时段swing
+fn proc_htf_swing(candles: &[Candle], symbol: &str, interval: &str) -> Result<Option<WatchSwing>> {
+
+    /*
+        1.判断是否存在Watching状态的记录
+            - 存在：
+            - 不存在
+    */
+    let find_options = FindOneOptions::builder().sort(doc! { "time": -1 }).build();
+    match WatchSwing::collection().find_one(doc! {"symbol": symbol, "interval": interval, "status": {"$in": [SwingStatus::Watching as i32, SwingStatus::WaitingBackFvg as i32]}}, find_options) {
+        Ok(x) => {
+            match x {
+                Some(watch) => {
+                    return Ok(Some(watch));
+                },
+                None => {}
+            }
+        },
+        Err(e) => println!("Error {e}"),
+    }
+
+    /*
+        判断htf是否存在假突破
+                            
+        - 3根短-长-短形态蜡烛，中间蜡烛必须穿透前摆动高
+                  |
+                | | |
+        - 判断第三根低点是否在前高点之下？？？？， 主要是判断是否完成突破不进行观察 todo!
+
+    
+    */
+    let find_options = FindOptions::builder().sort(doc! { "time": -1 }).limit(2).build();
+    if candles[1].time_date == "2021-03-23T04:00:00.000Z" {
+        print!("");
+    }
+
+    let cursor = Zigzag::collection().find(doc! {"symbol": symbol, "interval": interval, "time": {"$lt": candles[0].time}}, find_options)?;
+    
+    let mut cnt = 0;
+    for ret in cursor {
+        cnt += 1;
+        if cnt == 2 {
+            let x = ret?;
+            let mut one = 0f64;
+            let mut two = 0f64;
+            let mut three = 0f64;
+            let mut watchFlag = false;
+
+            if x.tag == 1 {//high -> short
+                one = candles[0].high;
+                two = candles[1].high;
+                three = candles[2].high;
+
+                //1.trade through & valid swing high
+                if two > x.value.max(one.max(three)) {
+                    watchFlag = true;
+                }
+            }
+            else { //low -> long
+                one = candles[0].low;
+                two = candles[1].low;
+                three = candles[2].low;
+
+                if two < x.value.min(one.min(three)) {
+                    watchFlag = true;
+                }
+            }
+
+            if watchFlag {
+                let watch = WatchSwing {
+                    id: ObjectId::new(),
+                    time: x.time,
+                    symbol: symbol.to_string(),
+                    interval: interval.to_string(),
+                    value: x.value,
+                    time_date: x.time_date,
+                    status: SwingStatus::Watching as i32,
+                    tag: x.tag, //H, L  1, -1
+                    one: SwingUnit {
+                        time: candles[0].time,
+                        time_date: candles[0].time_date.to_owned(),
+                        value: one
+                    },
+                    two: SwingUnit {
+                        time: candles[1].time,
+                        time_date: candles[1].time_date.to_owned(),
+                        value: two
+                    },
+                    three: SwingUnit {
+                        time: candles[2].time,
+                        time_date: candles[2].time_date.to_owned(),
+                        value: three
+                    },
+                    ltf_swing: None,
+                    fvg1: None,
+                    fvg2: None,
+                    fvg3: None,
+                    fb_zero_value: None
+                };
+
+                let result = WatchSwing::collection().insert_one(&watch, None)?;
+
+                // watch.id = Some(result.inserted_id);
+
+                return Ok(Some(watch))
+            }
+        }
+    }
+        
+    Ok(None)
+}
+
+fn backtest_swing() -> Result<()>{
+    let symbol = "BTCUSDT";
+    let htf_interval = "4h";
+    let ltf_interval = "15m";
+
+    let find_options = FindOptions::builder().sort(doc !{ "time": 1 }).build();
+
+    let start_time = 1616198400000i64;
+
+    let cursor = Candle::collection().find(doc! {"symbol": symbol, "interval": htf_interval, "time": {"$gt": start_time} }, find_options)?;
+
+    let mut vec: Vec<Candle> = Vec::new();
+
+    for ret in cursor {
+        let candle = ret?;
+        vec.push(candle);
+    }
+
+    let length = vec.len();
+    for i in 0..length {
+        if i+3 >= length {
+            break;
+        }
+        let candles: &[Candle] = &vec[i..i+3];
+
+        if let Some(mut watch) = proc_htf_swing(candles, symbol, htf_interval)? {
+            match watch.status.try_into() {
+                Ok(SwingStatus::Closed) => (),
+                _ => {
+                    
+                    let mut time = 0i64;
+                        
+                    loop {
+
+                        match watch.status.try_into() {
+                            Ok(SwingStatus::Closed) => {
+                                break;
+                            },
+                            _ => ()
+                        }
+                        let mut limit = 3;
+
+                        if time == 0 {
+                            if let Some(fvg1) = &watch.fvg1 {
+                                limit = 1;
+                                if let Some(ltf_swing) = &watch.ltf_swing {
+                                    //fvg1.end_time有可能是breakout_time之后的candle
+                                    time = ltf_swing.breakout_time.max(fvg1.end_time);
+                                }
+                            }
+                            else if let Some(ltf_swing) = &watch.ltf_swing {
+                                time = ltf_swing.time;
+                            }
+                            else {
+                                time = watch.time;
+                            }
+                        }
+
+                        let mut ltf_vet = Vec::new();
+                        let mut vet_length = ltf_vet.len();
+                        if vet_length < 10 { //低于10个就从库中获取
+                            let find_options = FindOptions::builder().sort(doc !{ "time": 1}).limit(500).build();
+                            let cursor = Candle::collection().find(doc! {"symbol": symbol, "interval": ltf_interval, "time": { "$gt": time}}, find_options)?;
+                            for ret in cursor {
+                                ltf_vet.push(ret?);
+                            }
+
+                            vet_length = ltf_vet.len();
+                        }
+
+                        for i in 0..vet_length {
+                            if i+limit > vet_length {
+                                break;
+                            }
+                            time = ltf_vet[i+limit - 1].time;
+                            let candles = &ltf_vet[i..i+limit];
+
+                            if let None = &watch.ltf_swing {
+                                proc_ltf_swing(&mut watch, candles, symbol, ltf_interval)?;
+                            }
+                            else if let None = &watch.fvg1 {
+                                if proc_form_fvg(&mut watch, candles, symbol, ltf_interval)? {
+                                    limit = 1;
+                                }
+                            }
+                            else {
+                                proc_backto_fvg(&mut watch, &candles[0], symbol, htf_interval)?;
+                            }
+                            
+                            match watch.status.try_into() { 
+                                Ok(SwingStatus::Closed) =>  {
+                                    break;
+                                },
+                                _ => ()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+
+}
+
+
+fn proc_candles() -> Result<()> {
+    let mut id: Option<ObjectId> = Some(ObjectId::parse_str("6296dd4d6a25c96d96ea63a3")?);
+
+    loop {
+        let mut dc = doc! {};
+        if let Some(oid) = id {
+            dc = doc! {"_id": {"$gt": oid}};
+        }
+        let find_options = FindOptions::builder().sort(doc! { "_id": 1 }).limit(1000).build();
+        let cursor = Candle::collection().find(dc, find_options)?;
+
+        let mut has = false;
+
+        for ret in cursor {
+            has = true;
+            let candle = ret?;
+            let open_value = candle.open;
+            let close_value = candle.close;
+            let low_value = candle.low;
+            let high_value = candle.high;
+
+            let r = Candle::collection().update_one(doc! {"_id": candle.id}, doc! { "$set": { "open_value": open_value, "close_value": close_value, "low_value": low_value, "high_value": high_value} }, None)?;
+            
+            println!("{:?}, {:?}", candle.id, r.modified_count);
+            
+            id = Some(candle.id);
+        }
+
+        if !has {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn main() {
+
+
+    compute_zigzag("BTCUSDT", "1d");
+
+
+
+    // backtest_swing().unwrap();
+    
+
+    
+    // proc_candles().unwrap();
+
+
+
+
+    /* let symbol = "BTCUSDT";
+    let interval = "1d";
+    let step_size = match get_exchange_info(symbol) {
+        Ok(x) => x,
+        Err(e) => {panic!("Problem opening the file: {:?}", e)}
+    }; 
+
+    println!("step_size -> {}", step_size);
+*/
+    /* 
+    let keep_running = AtomicBool::new(true);
+    let kline: String = format!("{}", "BTCUSDT@kline_1m");
+
+    let mut web_socket: WebSockets = WebSockets::new(|event: WebsocketEvent| {
+        match event {
+            WebsocketEvent::Kline(kline_event) => {
+                println!("Symbol: {}, high: {}, low: {}", kline_event.kline.symbol, kline_event.kline.low, kline_event.kline.high);
+            },
+            _ => (),
+        };
+        Ok(())
+    });
+
+    web_socket.connect(&kline).unwrap();
+    if let Err(e) = web_socket.event_loop(&keep_running) {
+        match e {
+            error => {
+                println!("Errror: {:>}", error);
+            }
+        }
+    } */
+
+
+    //
+
+    /* for x in (0..100).rev() {
+        println!("{}", x);
+    }
+
+    return (); */
+
+    // let v = vec![1,2,3];
+    // let a = &v[1..2];
+
+    // println!("{a:?}", );
+    
+    // let market: Market = Binance::new(None, None);
+    // match market.get_all_prices() {
+    //     Ok(answer) => println!("{answer:#?}"),
+    //     Err(e) => println!("{e:?}")
+    // }
+
+    // process();
+
+    //1 zigzag
+
+    
+}
